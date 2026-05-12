@@ -1,15 +1,5 @@
 ---
 title: Kthena Router Benchmark Framework
-authors:
-- TBD
-reviewers:
-- "@YaoZengzeng"
-- "@hzxuzhonghu"
-approvers:
-- TBD
-
-creation-date: 2026-05-12
-status: draft
 tracking-issue: https://github.com/volcano-sh/kthena/issues/942
 ---
 
