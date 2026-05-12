@@ -1,8 +1,3 @@
----
-title: Kthena Router Benchmark Framework
-tracking-issue: https://github.com/volcano-sh/kthena/issues/942
----
-
 # Proposal: Kthena Router Benchmark Framework
 
 ## Summary
