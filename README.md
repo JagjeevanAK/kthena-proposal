@@ -2,268 +2,430 @@
 
 ## Summary
 
-Kthena Router is the data-plane component that receives OpenAI-compatible inference
-requests, resolves the target model and route, applies traffic policy, chooses an
-in-cluster backend, and forwards requests to model-serving pods. As the router grows
-to support more routing strategies, prefill-decode disaggregation, rate limiting,
-fairness scheduling, KV-cache-aware placement, and third-party backends, the project
-needs a reproducible benchmark framework that can answer a simple question for each
-release: did router performance improve, stay stable, or regress?
+Kthena Router is the data-plane component that receives OpenAI-compatible LLM
+inference requests, resolves the target model, applies route policy, selects a
+backend pod, and proxies the request to in-cluster or external model backends. As
+Kthena Router adds more routing strategies, rate limits, fairness scheduling,
+prefill-decode disaggregation, KV-cache-aware placement, and third-party backend
+support, maintainers need a repeatable way to answer a release-critical question:
+did router performance improve, stay stable, or regress?
 
-This proposal defines a benchmark framework for Kthena Router that is runnable on a
-developer machine, in a Kubernetes cluster, and in CI. The framework will include a
-load generator, scenario definitions, mock and real backend support, Prometheus-based
-metrics collection, profile capture, result aggregation, and a report template. It
-will measure throughput, latency, tail latency, time to first token (TTFT), time per
-output token (TPOT), request errors, scheduler/plugin cost, CPU, memory, and, when
-available, GPU utilization. Benchmark results will be stored as structured artifacts
-so maintainers can compare releases and validate upstream optimizations with
-before/after numbers.
+This RFC proposes a reusable benchmark framework under `benchmark/kthena-router`.
+The framework will provide a deterministic load generator, declarative scenario
+configs, GPU-free mock backends, optional real vLLM/SGLang backend runs, metrics
+collection, result aggregation, comparison reports, and a runbook. The first
+deliverable is deliberately scoped to an approvable MVP that can run locally and in
+CI without GPUs. Real-model benchmarks, profiling automation, and optimization PRs
+are included as release and stretch work once the core framework is trusted.
 
-This proposal tracks the feature request in issue #942.
+This proposal tracks the LFX mentorship project request in issue `#942`.
 
 ## Motivation
 
-Router performance has a direct effect on user-visible inference latency and on the
-amount of traffic a Kthena installation can serve with fixed cluster resources.
-Without a shared benchmark, performance claims are hard to reproduce because each
-developer may use different prompt sizes, output sizes, backend behavior, routing
-rules, concurrency, hardware, and metric collection windows. This makes it difficult
-to identify bottlenecks, review optimization PRs, or detect regressions before a
-release.
+Router performance directly affects user-visible latency and cluster capacity.
+Today, performance claims are hard to compare because different contributors may
+use different prompt sizes, output sizes, datasets, backend behavior, routing
+plugins, concurrency levels, hardware, and metric windows. That makes it difficult
+to review optimization PRs, detect regressions before release, or decide whether a
+new routing strategy is worth its added overhead.
 
-LLM routing also differs from generic HTTP proxy benchmarking. Realistic scenarios
-must model streaming responses, long-running requests, different prompt and response
-token distributions, varying concurrency, model-specific routing, rate limits,
-prefill-decode flows, KV-cache locality, backend saturation, and failures. The
-framework should therefore be specific to Kthena Router while reusing standard tools
-and Kubernetes-native observability where possible.
+LLM router benchmarking is not the same as generic HTTP benchmarking. Useful
+scenarios must model streaming responses, TTFT, TPOT, long-running requests,
+backend saturation, repeated prefixes, routing strategy overhead, rate limiting,
+and partial backend failures. The benchmark therefore needs to be Kthena-specific
+while still using standard Kubernetes and Prometheus primitives where possible.
 
-### Goals
+## Design Principles
 
-- Provide a reusable Kthena Router benchmark framework under `benchmark/kthena-router`.
-- Support local, Kubernetes Job, and CI execution modes.
-- Define versioned scenario configs for common LLM routing workloads.
-- Generate OpenAI-compatible completion and chat-completion traffic.
-- Support both mock backends and real inference backends such as vLLM and SGLang.
-- Measure throughput, latency, p50/p90/p95/p99, TTFT, TPOT, request success rate,
-  scheduler/plugin latency, router CPU, router memory, and backend GPU metrics when
-  available.
-- Collect router Prometheus metrics, backend metrics, Kubernetes pod resource usage,
-  and optional `pprof` profiles in a single run artifact.
-- Produce machine-readable results for CI gates and human-readable reports for
-  release notes and optimization PRs.
-- Define an end-to-end runbook covering cluster setup, benchmark execution, result
-  interpretation, and cleanup.
-- Identify clear bottlenecks and guide upstream optimization PRs with before/after
-  evidence.
+- Make the first version useful without GPU access.
+- Separate router overhead from backend inference cost.
+- Prefer reproducibility over impressive absolute numbers.
+- Keep scenario and result schemas stable enough for CI and release comparison.
+- Record enough environment metadata to explain variance.
+- Treat performance regression gates cautiously in normal PR CI.
+- Build on current Kthena primitives instead of inventing a parallel control plane.
+- Keep real-model and profiling benchmarks optional until the mock path is reliable.
 
-### Non-Goals
+## Current State
 
-- This proposal does not define an official Kthena Router service-level objective.
-- This proposal does not require GPU hardware for every benchmark scenario.
-- This proposal does not replace existing unit, integration, or e2e tests.
-- This proposal does not implement a general-purpose benchmark platform for all
-  Kthena components.
-- This proposal does not require benchmarking every possible model, inference engine,
-  tokenizer, or third-party provider.
-- This proposal does not guarantee identical absolute results across heterogeneous
-  hardware; it focuses on reproducibility within a documented environment and on
-  comparable trends across commits and releases.
+The repository already contains a minimal router benchmark scaffold at
+`benchmark/kthena-router`. It packages an SGLang `bench_serving.py`-based load
+generator as a Docker image and runs it as a Kubernetes Job. This is useful as a
+seed, but it is not yet a reproducible Kthena Router benchmark framework because it
+does not define Kthena scenario schemas, mock backends, stable result artifacts,
+router-specific metric aggregation, CI thresholds, or baseline comparison.
 
-## Proposal
+The router already exposes important observability hooks:
 
-Introduce a benchmark framework with four layers:
+- `/metrics` on the router listener for Prometheus metrics.
+- `/debug/config_dump/*` on a localhost-only debug server for internal state.
+- `/debug/pprof/*` on the same localhost-only debug server for CPU, heap,
+  goroutine, block, mutex, and allocation profiles.
 
-1. Workload generation: sends realistic OpenAI-compatible requests to Kthena Router.
-2. Scenario orchestration: installs or points to backends, applies Kthena resources,
-   runs a configured workload, and controls warmup/measurement/cooldown phases.
-3. Metrics and profile collection: gathers client-side results, router metrics,
-   backend metrics, Kubernetes resource usage, and optional profiles.
+The benchmark should therefore collect existing metrics and profiles rather than
+requiring a new observability subsystem. For Kubernetes benchmark jobs, profile
+collection must account for the debug server being bound to localhost; the runbook
+should use a safe mechanism such as `kubectl port-forward`, running the collector
+inside the router pod namespace, or a controlled debug sidecar if maintainers
+approve one.
+
+## Goals
+
+- Provide a reusable benchmark framework under `benchmark/kthena-router`.
+- Support local process mode, Kind-based Kubernetes mode, and CI smoke mode.
+- Generate OpenAI-compatible `/v1/completions` and `/v1/chat/completions` traffic.
+- Support non-streaming and streaming responses with TTFT and TPOT measurement.
+- Provide deterministic mock backends that isolate router overhead from inference
+  engine cost.
+- Provide declarative scenario configs for common LLM routing workloads.
+- Collect client metrics, router Prometheus metrics, Kubernetes pod resources, and
+  optional backend metrics.
+- Write self-contained run artifacts with scenario config, environment metadata,
+  summary tables, and machine-readable JSON.
+- Provide comparison reports for baseline versus candidate runs.
+- Document an end-to-end runbook for local, CI, and release benchmark execution.
+
+## Non-Goals
+
+- Define an official Kthena Router SLO.
+- Require GPUs for PR CI.
+- Replace unit tests, integration tests, or e2e tests.
+- Build a generic benchmark platform for all Kthena components.
+- Benchmark every model, tokenizer, inference engine, or third-party provider.
+- Guarantee identical absolute results across different hardware.
+- Make normal PR CI depend on real model downloads, Hugging Face availability, or
+  dedicated benchmark infrastructure.
+- Implement a full optimization campaign before the benchmark framework is usable.
+
+## Architecture
+
+The framework has four layers:
+
+1. Workload generation: sends OpenAI-compatible requests to Kthena Router.
+2. Scenario orchestration: prepares router config, Kthena resources, backends, and
+   benchmark phases.
+3. Metrics and artifact collection: gathers client results, router metrics, pod
+   resources, logs, and optional profiles.
 4. Result aggregation and reporting: writes normalized JSON/CSV/Markdown artifacts
-   and compares current results with a baseline.
+   and compares candidate runs with baselines.
 
-The initial implementation may reuse the existing `benchmark/kthena-router`
-scaffold, which currently packages an SGLang `bench_serving.py`-based load generator
-as a container and Kubernetes Job. The framework should evolve that scaffold into a
-Kthena-specific benchmark suite with stable scenarios, reproducible outputs, and CI
-integration.
+```mermaid
+graph TB
+    CLI[kthena-router-bench CLI] --> Scenario[Scenario Loader and Validator]
+    Scenario --> Orchestrator[Scenario Orchestrator]
+    Orchestrator --> LoadGen[Load Generator]
+    Orchestrator --> MockBackend[Mock Backends]
+    Orchestrator --> Kube[Kubernetes API]
+    Orchestrator --> Prom[Prometheus or Metrics Endpoint]
 
-### User Stories
+    LoadGen --> Router[Kthena Router]
+    Router --> MockBackend
+    Router --> RealBackend[vLLM or SGLang Backend]
+    Router --> ThirdPartyStub[Third-Party Backend Stub]
 
-#### Story 1: Maintainer Checks a Router Optimization PR
+    Prom --> Aggregator[Result Aggregator]
+    LoadGen --> Aggregator
+    Kube --> Aggregator
+    Aggregator --> Artifacts[run.json, summary.csv, report.md]
+    Artifacts --> Compare[Baseline Compare]
+```
 
-A maintainer wants to review a router scheduling optimization. They run a baseline
-benchmark against `main`, apply the PR, run the same scenarios, and receive a
-comparison report showing throughput, p99 latency, TTFT, TPOT, CPU, memory, and
-scheduler plugin cost. The report shows whether the change improves the target
-scenario without regressing other scenarios.
+### Request and Measurement Flow
 
-#### Story 2: Contributor Runs a Local Smoke Benchmark
+```mermaid
+sequenceDiagram
+    participant B as Benchmark Client
+    participant R as Kthena Router
+    participant S as Scheduler Plugins
+    participant M as Mock or Real Backend
+    participant P as Metrics Collector
 
-A contributor without GPU access wants to check whether a router change introduces a
-major performance regression. They run a local or Kind-based mock-backend smoke
-scenario that completes in minutes and produces a concise result file.
+    B->>R: OpenAI-compatible request
+    R->>S: Select backend pod
+    S-->>R: Selected pod and plugin timings
+    R->>M: Forward request
+    M-->>R: Stream or full response
+    R-->>B: Stream or full response
+    B->>B: Measure latency, TTFT, TPOT, errors
+    P->>R: Scrape /metrics
+    P->>P: Aggregate pod CPU, memory, logs, profiles
+```
 
-#### Story 3: Release Manager Produces Release Benchmark Results
+### Kthena Integration Boundary
 
-A release manager runs the full benchmark suite on a documented cluster profile
-before release. The generated report is attached to release notes and includes the
-exact Kthena commit, image tags, scenario configs, cluster size, backend type, and
-result tables.
+Benchmark scenarios must map to existing Kthena concepts:
 
-#### Story 4: Maintainer Investigates a Bottleneck
+- `ModelRoute` selects the logical model and target `ModelServer`.
+- `ModelServer` selects backend pods and defines timeout/retry behavior.
+- Router scheduler configuration selects score and filter plugins such as
+  `random`, `least-request`, `least-latency`, `prefix-cache`, and
+  `kvcache-aware`.
+- Backend deployments expose OpenAI-compatible endpoints and optional metrics.
+- The benchmark framework owns only test resources in its namespace and should not
+  mutate unrelated cluster state.
 
-A maintainer sees high tail latency in the benchmark report. They rerun the scenario
-with `--profile=true`, capture router CPU and heap profiles, and use the flamegraph
-to identify hot code paths in request parsing, scheduling, datastore access, or
-response streaming.
+This is important because routing strategy is currently configured through router
+scheduler configuration, not through `ModelServer.trafficPolicy`. Scenario configs
+therefore must describe both Kthena resources and router scheduler config instead
+of using an abstract `routing.strategy` field that has no direct API mapping.
 
-## Design Details
+## MVP and Stretch Scope
 
-### Repository Structure
+### MVP Deliverables
 
-The framework will live under `benchmark/kthena-router`:
+The mentorship should first land a reliable, reviewable MVP:
+
+- `kthena-router-bench` CLI with `validate`, `run`, `report`, and `compare`.
+- Scenario schema and result schema.
+- Deterministic mock backend with streaming and non-streaming OpenAI-compatible
+  endpoints.
+- Three required scenarios:
+  - `smoke`
+  - `streaming-chat`
+  - `multi-backend-least-request`
+- Router Prometheus metric scraping from `/metrics`.
+- Kubernetes pod CPU and memory collection when running in cluster mode.
+- Self-contained artifacts: `run.json`, `summary.csv`, `report.md`,
+  `scenario.yaml`, and `environment.json`.
+- Kind-based smoke runbook.
+- CI smoke workflow that validates framework behavior and artifact generation.
+
+### Stretch and Release Deliverables
+
+These should be added after the MVP is stable:
+
+- Throughput and latency sweeps.
+- KV-cache-aware shared-prefix scenario.
+- Rate-limit and backend-failure scenarios.
+- Optional pprof capture from the router debug server.
+- Real-backend runbook for vLLM and SGLang.
+- Nightly or release benchmarks on dedicated infrastructure.
+- Optimization PRs for bottlenecks found by the benchmark, with before/after
+  numbers.
+
+## Repository Layout
 
 ```text
 benchmark/kthena-router/
   README.md
   Makefile
   Dockerfile
-  go.mod or pyproject.toml
   cmd/
     kthena-router-bench/
       main.go
   pkg/
     loadgen/
-      client.go
-      openai.go
-      scheduler.go
-      stream.go
-      latency.go
     scenario/
-      config.go
-      loader.go
-      validate.go
+    backend/mock/
     metrics/
-      prometheus.go
-      kube.go
-      nvidia.go
-      pprof.go
-      aggregate.go
     report/
-      compare.go
-      markdown.go
-      json.go
-    backend/
-      mock/
-        server.go
-        deployment.yaml
-      vllm/
-        values.yaml
-      sglang/
-        values.yaml
+    artifacts/
   scenarios/
     smoke.yaml
+    streaming-chat.yaml
+    multi-backend-least-request.yaml
     throughput-sweep.yaml
     latency-sweep.yaml
-    streaming-chat.yaml
-    multi-backend-random.yaml
-    multi-backend-least-request.yaml
     kvcache-aware-shared-prefix.yaml
-    prefill-decode-disaggregation.yaml
     rate-limit.yaml
     backend-failure.yaml
   manifests/
     job.yaml
     rbac.yaml
-    configmap.yaml
-    servicemonitor.yaml
     mock-backend.yaml
-  scripts/
-    run-local.sh
-    run-kind.sh
-    run-cluster.sh
-    collect-artifacts.sh
-    compare.sh
+    servicemonitor.yaml
   reports/
     template.md
   results/
     .gitignore
 ```
 
-The exact implementation language can be Go or Python. Go is preferred for tight
-integration with Kubernetes APIs, Kthena types, Prometheus parsing, and CI packaging.
-Python is acceptable for a load-generator-only first milestone if the interface and
-artifacts remain stable.
+Go is preferred for the benchmark CLI because the Kthena codebase is Go, the
+router APIs and Kubernetes clients are Go-native, and CI packaging is simpler. The
+current SGLang `bench_serving.py` wrapper may be reused for comparison or real
+backend experiments, but it should not be the only supported benchmark path.
 
-### Benchmark CLI
+## Public Interface
 
-The benchmark binary will provide a stable command interface:
+### CLI
 
 ```bash
+kthena-router-bench validate \
+  --scenario benchmark/kthena-router/scenarios/smoke.yaml
+
 kthena-router-bench run \
   --scenario benchmark/kthena-router/scenarios/smoke.yaml \
   --target http://kthena-router.kthena-system.svc.cluster.local \
   --namespace kthena-benchmark \
-  --output results/smoke-$(date +%Y%m%d-%H%M%S) \
-  --prometheus-url http://prometheus.monitoring.svc:9090 \
-  --profile=false
+  --output benchmark/kthena-router/results/smoke \
+  --prometheus-url http://prometheus.monitoring.svc:9090
+
+kthena-router-bench report \
+  --input benchmark/kthena-router/results/smoke/run.json \
+  --output benchmark/kthena-router/results/smoke/report.md
+
+kthena-router-bench compare \
+  --baseline benchmark/kthena-router/results/main/run.json \
+  --candidate benchmark/kthena-router/results/pr/run.json
+
+kthena-router-bench mock-backend \
+  --listen :8000 \
+  --config benchmark/kthena-router/scenarios/mock-backend.yaml
 ```
 
-Additional commands:
+### Scenario Structs
 
-```bash
-kthena-router-bench validate --scenario scenarios/smoke.yaml
-kthena-router-bench report --input results/run.json --output results/report.md
-kthena-router-bench compare --baseline results/main.json --candidate results/pr.json
-kthena-router-bench mock-backend --listen :8000 --profile mock-backend.yaml
+The scenario API is a benchmark-local config format, not a Kubernetes CRD in the
+first implementation. It uses Kubernetes-style metadata only because that shape is
+familiar to Kthena contributors.
+
+```go
+type RouterBenchmarkScenario struct {
+    APIVersion string         `json:"apiVersion" yaml:"apiVersion"`
+    Kind       string         `json:"kind" yaml:"kind"`
+    Metadata   ScenarioMeta   `json:"metadata" yaml:"metadata"`
+    Target     TargetSpec     `json:"target" yaml:"target"`
+    Traffic    TrafficSpec    `json:"traffic" yaml:"traffic"`
+    Requests   RequestSpec    `json:"requests" yaml:"requests"`
+    Kthena     KthenaSpec     `json:"kthena" yaml:"kthena"`
+    Backends   BackendSpec    `json:"backends" yaml:"backends"`
+    Metrics    MetricsSpec    `json:"metrics" yaml:"metrics"`
+    Thresholds ThresholdSpec  `json:"thresholds" yaml:"thresholds"`
+}
+
+type ScenarioMeta struct {
+    Name        string            `json:"name" yaml:"name"`
+    Description string            `json:"description,omitempty" yaml:"description,omitempty"`
+    Labels      map[string]string `json:"labels,omitempty" yaml:"labels,omitempty"`
+}
+
+type TargetSpec struct {
+    URL  string `json:"url" yaml:"url"`
+    Path string `json:"path" yaml:"path"`
+}
+
+type TrafficSpec struct {
+    Mode              string `json:"mode" yaml:"mode"` // fixed_qps, poisson, closed_loop
+    RequestRate       int    `json:"requestRate,omitempty" yaml:"requestRate,omitempty"`
+    MaxConcurrency    int    `json:"maxConcurrency" yaml:"maxConcurrency"`
+    WarmupSeconds     int    `json:"warmupSeconds" yaml:"warmupSeconds"`
+    DurationSeconds   int    `json:"durationSeconds" yaml:"durationSeconds"`
+    CooldownSeconds   int    `json:"cooldownSeconds,omitempty" yaml:"cooldownSeconds,omitempty"`
+    RequestTimeoutSec int    `json:"requestTimeoutSeconds" yaml:"requestTimeoutSeconds"`
+}
+
+type RequestSpec struct {
+    API          string            `json:"api" yaml:"api"` // completions, chat_completions
+    Model        string            `json:"model" yaml:"model"`
+    Stream       bool              `json:"stream" yaml:"stream"`
+    Prompt       TokenDistribution `json:"prompt" yaml:"prompt"`
+    OutputTokens TokenDistribution `json:"outputTokens" yaml:"outputTokens"`
+}
+
+type KthenaSpec struct {
+    ModelRouteManifest       string              `json:"modelRouteManifest" yaml:"modelRouteManifest"`
+    ModelServerManifest      string              `json:"modelServerManifest" yaml:"modelServerManifest"`
+    RouterSchedulerConfig    RouterSchedulerSpec `json:"routerSchedulerConfig" yaml:"routerSchedulerConfig"`
+    GatewayManifests         []string            `json:"gatewayManifests,omitempty" yaml:"gatewayManifests,omitempty"`
+    AdditionalManifests      []string            `json:"additionalManifests,omitempty" yaml:"additionalManifests,omitempty"`
+}
+
+type RouterSchedulerSpec struct {
+    ScorePlugins  []WeightedPlugin `json:"scorePlugins" yaml:"scorePlugins"`
+    FilterPlugins []string         `json:"filterPlugins,omitempty" yaml:"filterPlugins,omitempty"`
+}
+
+type WeightedPlugin struct {
+    Name   string `json:"name" yaml:"name"`
+    Weight int    `json:"weight" yaml:"weight"`
+}
+
+type BackendSpec struct {
+    Mode        string              `json:"mode" yaml:"mode"` // mock, real, third_party_stub
+    Replicas    int                 `json:"replicas" yaml:"replicas"`
+    MockProfile *MockBackendProfile `json:"mockProfile,omitempty" yaml:"mockProfile,omitempty"`
+}
+
+type MockBackendProfile struct {
+    TTFTMillis       int     `json:"ttftMillis" yaml:"ttftMillis"`
+    PerTokenMillis   int     `json:"perTokenMillis" yaml:"perTokenMillis"`
+    ErrorRate        float64 `json:"errorRate,omitempty" yaml:"errorRate,omitempty"`
+    ExposeMetrics    bool    `json:"exposeMetrics" yaml:"exposeMetrics"`
+    RoutingAwareMode bool    `json:"routingAwareMode" yaml:"routingAwareMode"`
+}
+
+type TokenDistribution struct {
+    Distribution string  `json:"distribution" yaml:"distribution"` // fixed, uniform, lognormal, dataset, shared_prefix
+    Tokens       int     `json:"tokens,omitempty" yaml:"tokens,omitempty"`
+    MinTokens    int     `json:"minTokens,omitempty" yaml:"minTokens,omitempty"`
+    MaxTokens    int     `json:"maxTokens,omitempty" yaml:"maxTokens,omitempty"`
+    MeanTokens   float64 `json:"meanTokens,omitempty" yaml:"meanTokens,omitempty"`
+    P95Tokens    int     `json:"p95Tokens,omitempty" yaml:"p95Tokens,omitempty"`
+    DatasetPath  string  `json:"datasetPath,omitempty" yaml:"datasetPath,omitempty"`
+}
+
+type MetricsSpec struct {
+    ScrapeIntervalSeconds      int  `json:"scrapeIntervalSeconds" yaml:"scrapeIntervalSeconds"`
+    CollectRouterMetrics       bool `json:"collectRouterMetrics" yaml:"collectRouterMetrics"`
+    CollectBackendMetrics      bool `json:"collectBackendMetrics" yaml:"collectBackendMetrics"`
+    CollectKubernetesMetrics   bool `json:"collectKubernetesMetrics" yaml:"collectKubernetesMetrics"`
+    CollectProfiles            bool `json:"collectProfiles" yaml:"collectProfiles"`
+}
+
+type ThresholdSpec struct {
+    MaxErrorRate          float64 `json:"maxErrorRate,omitempty" yaml:"maxErrorRate,omitempty"`
+    MaxP99LatencySeconds float64 `json:"maxP99LatencySeconds,omitempty" yaml:"maxP99LatencySeconds,omitempty"`
+    MaxP99TTFTSeconds    float64 `json:"maxP99TTFTSeconds,omitempty" yaml:"maxP99TTFTSeconds,omitempty"`
+    MaxRouterCPUCoreAvg  float64 `json:"maxRouterCPUCoreAvg,omitempty" yaml:"maxRouterCPUCoreAvg,omitempty"`
+}
 ```
 
-### Scenario Configuration
-
-Scenarios will be declarative YAML files. Each file describes the request shape,
-arrival pattern, routing setup, backend shape, metrics collection, and pass/fail
-thresholds.
+### Example Scenario
 
 ```yaml
 apiVersion: benchmark.kthena.volcano.sh/v1alpha1
 kind: RouterBenchmarkScenario
 metadata:
-  name: streaming-chat-shared-prefix
-description: Streaming chat workload with repeated system prompts and variable outputs.
+  name: streaming-chat
+  description: Streaming chat workload through Kthena Router with mock backends.
 target:
-  scheme: http
-  host: kthena-router.kthena-system.svc.cluster.local
-  port: 80
+  url: http://kthena-router.kthena-system.svc.cluster.local
   path: /v1/chat/completions
 traffic:
   mode: poisson
-  requestRate: 100
-  maxConcurrency: 256
-  warmupSeconds: 60
-  durationSeconds: 300
-  cooldownSeconds: 30
+  requestRate: 50
+  maxConcurrency: 128
+  warmupSeconds: 30
+  durationSeconds: 180
+  cooldownSeconds: 15
+  requestTimeoutSeconds: 60
 requests:
   api: chat_completions
   model: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
   stream: true
   prompt:
-    distribution: generated_shared_prefix
-    groups: 64
-    promptsPerGroup: 16
-    systemPromptTokens: 512
-    userPromptTokens:
-      distribution: lognormal
-      mean: 1024
-      p95: 4096
+    distribution: fixed
+    tokens: 1024
   outputTokens:
     distribution: fixed
-    value: 256
-routing:
-  modelRoute: ds7b-route
-  strategy: kvcache-aware
-  backends: 8
+    tokens: 256
+kthena:
+  modelRouteManifest: manifests/modelroute-streaming-chat.yaml
+  modelServerManifest: manifests/modelserver-streaming-chat.yaml
+  routerSchedulerConfig:
+    scorePlugins:
+      - name: least-request
+        weight: 100
+    filterPlugins: []
+backends:
+  mode: mock
+  replicas: 4
+  mockProfile:
+    ttftMillis: 120
+    perTokenMillis: 20
+    errorRate: 0
+    exposeMetrics: true
+    routingAwareMode: true
 metrics:
   scrapeIntervalSeconds: 5
   collectRouterMetrics: true
@@ -271,133 +433,163 @@ metrics:
   collectKubernetesMetrics: true
   collectProfiles: false
 thresholds:
-  errorRateMax: 0.01
-  p99LatencySecondsMax: 20
-  p99TTFTSecondsMax: 3
-  routerCPUCoreMax: 2
+  maxErrorRate: 0.01
+  maxP99LatencySeconds: 20
+  maxP99TTFTSeconds: 3
+  maxRouterCPUCoreAvg: 2
 ```
 
-Scenario validation will reject missing target fields, unsupported distributions,
-invalid concurrency values, negative durations, and threshold definitions that cannot
-be evaluated.
+### Result Structs
 
-### Workload Model
+`run.json` is the source of truth for automation and comparison.
 
-The load generator will support:
+```go
+type BenchmarkRun struct {
+    SchemaVersion string             `json:"schemaVersion"`
+    Scenario      string             `json:"scenario"`
+    StartedAt     string             `json:"startedAt"`
+    DurationSec   int                `json:"durationSeconds"`
+    Environment   EnvironmentSummary `json:"environment"`
+    Client        ClientSummary      `json:"client"`
+    Router        RouterSummary      `json:"router"`
+    Backend       BackendSummary     `json:"backend,omitempty"`
+    Thresholds    ThresholdSummary   `json:"thresholds"`
+    Artifacts     []ArtifactRef      `json:"artifacts"`
+}
 
-- Fixed QPS.
-- Poisson arrival process for production-like request spacing.
-- Closed-loop concurrency mode for saturation testing.
-- Warmup, measurement, and cooldown phases.
-- Non-streaming `/v1/completions` requests.
-- Non-streaming `/v1/chat/completions` requests.
-- Streaming chat-completion requests with TTFT and token timing extraction.
-- Prompt distributions:
-  - fixed token length,
-  - uniform token length,
-  - lognormal token length,
-  - dataset-backed prompts,
-  - generated shared-prefix prompts for KV-cache-aware routing.
-- Output distributions:
-  - fixed,
-  - uniform,
-  - lognormal,
-  - scenario-defined sequence.
+type EnvironmentSummary struct {
+    KthenaCommit       string            `json:"kthenaCommit"`
+    RouterImage        string            `json:"routerImage"`
+    BenchmarkImage     string            `json:"benchmarkImage"`
+    KubernetesVersion  string            `json:"kubernetesVersion,omitempty"`
+    NodeCount          int               `json:"nodeCount,omitempty"`
+    CPUModel           string            `json:"cpuModel,omitempty"`
+    GPUModel           string            `json:"gpuModel,omitempty"`
+    Extra              map[string]string `json:"extra,omitempty"`
+}
 
-Token lengths should be generated through a tokenizer when available. For mock-only
-CI scenarios, deterministic synthetic text may be used with an approximate token
-ratio, but reports must mark those results as approximate.
+type ClientSummary struct {
+    OfferedQPS       float64           `json:"offeredQPS"`
+    CompletedQPS     float64           `json:"completedQPS"`
+    SuccessCount     int               `json:"successCount"`
+    FailureCount     int               `json:"failureCount"`
+    TimeoutCount     int               `json:"timeoutCount"`
+    ErrorRate        float64           `json:"errorRate"`
+    LatencySeconds   PercentileSummary `json:"latencySeconds"`
+    TTFTSeconds      PercentileSummary `json:"ttftSeconds,omitempty"`
+    TPOTSeconds      PercentileSummary `json:"tpotSeconds,omitempty"`
+    InputTokensPerS  float64           `json:"inputTokensPerSecond,omitempty"`
+    OutputTokensPerS float64           `json:"outputTokensPerSecond,omitempty"`
+}
 
-### Backend Modes
+type PercentileSummary struct {
+    P50 float64 `json:"p50"`
+    P90 float64 `json:"p90"`
+    P95 float64 `json:"p95"`
+    P99 float64 `json:"p99"`
+    Max float64 `json:"max"`
+}
 
-The benchmark framework will support three backend modes.
+type RouterSummary struct {
+    CPUCoresAvg              float64            `json:"cpuCoresAvg,omitempty"`
+    CPUCoresMax              float64            `json:"cpuCoresMax,omitempty"`
+    MemoryMiBAvg             float64            `json:"memoryMiBAvg,omitempty"`
+    MemoryMiBMax             float64            `json:"memoryMiBMax,omitempty"`
+    RequestsTotal            int                `json:"requestsTotal,omitempty"`
+    SchedulerPluginP99Seconds map[string]float64 `json:"schedulerPluginP99Seconds,omitempty"`
+}
 
-#### Mock Backend
+type BackendSummary struct {
+    Mode              string             `json:"mode"`
+    Replicas          int                `json:"replicas"`
+    ActiveRequestsMax int                `json:"activeRequestsMax,omitempty"`
+    QueueLengthMax    int                `json:"queueLengthMax,omitempty"`
+    TTFTSeconds       *PercentileSummary `json:"ttftSeconds,omitempty"`
+    TPOTSeconds       *PercentileSummary `json:"tpotSeconds,omitempty"`
+}
 
-The mock backend provides deterministic, GPU-free test behavior for local runs and
-CI. It will expose OpenAI-compatible endpoints and support:
+type ThresholdSummary struct {
+    Passed   bool     `json:"passed"`
+    Failures []string `json:"failures,omitempty"`
+}
 
+type ArtifactRef struct {
+    Name string `json:"name"`
+    Path string `json:"path"`
+    Type string `json:"type"`
+}
+```
+
+## Metric Definitions
+
+The benchmark must define metrics precisely so results can be reviewed and compared.
+
+| Metric | Definition |
+| --- | --- |
+| Offered QPS | Requests scheduled by the client per second during the measurement window. |
+| Completed QPS | Successful responses completed per second during the measurement window. |
+| End-to-end latency | Time from request start until full response completion or stream close. |
+| TTFT | For streaming responses, time from request start until the first response chunk containing generated content. |
+| TPOT | For streaming responses, time from first generated token/chunk until stream completion divided by generated output tokens. |
+| Error rate | Failed requests divided by total completed plus failed requests. Timeouts count as failures. |
+| Router CPU | Average and max CPU cores for router pods during the measurement window. |
+| Router memory | Average and max working set MiB for router pods during the measurement window. |
+| Scheduler plugin cost | Prometheus histogram summary for `kthena_router_scheduler_plugin_duration_seconds`. |
+
+Warmup and cooldown samples must not be included in reported latency percentiles or
+throughput. Reports should clearly mark approximate token counts when synthetic text
+is used without a real tokenizer.
+
+## Backend Modes
+
+### Mock Backend
+
+The mock backend is the default for local and PR CI runs. It exposes
+OpenAI-compatible endpoints and supports:
+
+- non-streaming responses,
+- streaming Server-Sent Events responses,
 - configurable TTFT delay,
 - configurable per-token delay,
 - configurable output token count,
-- streaming and non-streaming responses,
-- configurable error rate,
-- configurable status-code failure injection,
+- configurable error rate and status-code injection,
 - backend identity headers for routing validation,
 - Prometheus metrics for request count, active requests, TTFT, TPOT, and errors.
 
-The mock backend allows router overhead to be isolated from model inference cost.
+The mock backend must also support a routing-aware mode. In this mode, each mock pod
+can expose synthetic queue length, KV cache utilization, prefix-cache state, and pod
+identity. This lets routing scenarios validate balance and plugin overhead without
+claiming real-model speedups.
 
-#### Real Backend
+### Real Backend
 
-Real-backend scenarios will use existing Kthena examples and model-serving manifests
-for vLLM and SGLang where possible. These scenarios measure router behavior in a
-more realistic environment but are expected to be hardware-dependent.
+Real-backend scenarios use vLLM or SGLang deployments from Kthena examples where
+possible. These runs are hardware-dependent and are intended for release reports or
+optimization validation, not normal PR CI.
 
-#### Third-Party Backend Stub
+### Third-Party Backend Stub
 
-As Kthena adds third-party model backend support, the benchmark should include a
-stub mode that emulates an external backend over HTTP with configurable network
-latency and rate limits. This keeps the benchmark ready for future routing paths
-without depending on paid external providers.
+As Kthena adds third-party backend support, the benchmark can include a stub that
+emulates external HTTP latency, rate limits, and provider errors without using paid
+providers. This is a stretch item.
 
-### Metrics
+## Benchmark Scenarios
 
-The framework will collect client-side, router-side, backend-side, and cluster-side
-signals.
+| Scenario | Purpose | Backend | Required For |
+| --- | --- | --- | --- |
+| `smoke` | Validate basic router forwarding and artifact generation. | mock | MVP, PR CI |
+| `streaming-chat` | Measure streaming latency, TTFT, TPOT, and stream stability. | mock | MVP |
+| `multi-backend-least-request` | Validate multi-pod routing balance and scheduler plugin overhead. | mock | MVP |
+| `throughput-sweep` | Find sustainable QPS under fixed latency and error thresholds. | mock or real | Release |
+| `latency-sweep` | Measure p50-p99 latency across request rates. | mock or real | Release |
+| `kvcache-aware-shared-prefix` | Measure cache-aware plugin overhead and, with real backends, benefit. | routing-aware mock or real | Stretch |
+| `rate-limit` | Measure request rejection behavior and rate-limit overhead. | mock | Stretch |
+| `backend-failure` | Measure error behavior and tail latency during backend failure. | mock | Stretch |
+| `prefill-decode-disaggregation` | Measure PD path latency and connector behavior. | specialized mock or real | Stretch |
 
-Client-side metrics:
+## Result Artifacts
 
-- offered QPS,
-- completed QPS,
-- success count,
-- failure count,
-- timeout count,
-- HTTP status distribution,
-- throughput in requests/second,
-- input tokens/second,
-- output tokens/second,
-- latency p50/p90/p95/p99/max,
-- TTFT p50/p90/p95/p99/max,
-- TPOT p50/p90/p95/p99/max,
-- inter-token latency for streaming responses,
-- request body size and response body size summaries.
-
-Router Prometheus metrics:
-
-- `kthena_router_requests_total`,
-- `kthena_router_request_duration_seconds`,
-- `kthena_router_request_prefill_duration_seconds`,
-- `kthena_router_request_decode_duration_seconds`,
-- `kthena_router_tokens_total`,
-- `kthena_router_scheduler_plugin_duration_seconds`,
-- `kthena_router_rate_limit_exceeded_total`,
-- `kthena_router_active_downstream_requests`,
-- `kthena_router_active_upstream_requests`,
-- `kthena_router_fairness_queue_size`,
-- `kthena_router_fairness_queue_duration_seconds`.
-
-Backend and runtime metrics:
-
-- backend active requests,
-- backend queue length,
-- backend TTFT and TPOT when exposed,
-- KV cache utilization when exposed,
-- GPU utilization and GPU memory usage when available,
-- CPU and memory for backend pods.
-
-Cluster metrics:
-
-- router pod CPU usage,
-- router pod memory working set,
-- router restarts,
-- backend pod CPU and memory,
-- node CPU and memory saturation,
-- network transmit and receive bytes if available.
-
-### Result Artifacts
-
-Each run will write a self-contained output directory:
+Each benchmark run writes a self-contained output directory:
 
 ```text
 results/2026-05-12T10-30-00Z-smoke/
@@ -410,235 +602,150 @@ results/2026-05-12T10-30-00Z-smoke/
     router.json
     backend.json
     kube.json
-  profiles/
-    router-cpu.pb.gz
-    router-heap.pb.gz
   logs/
     benchmark.log
     router.log
     mock-backend.log
+  profiles/
+    router-cpu.pb.gz
+    router-heap.pb.gz
 ```
 
-`run.json` will be the source of truth for automated comparison:
+Profiles are only present when profiling is enabled. Missing optional collectors
+must be recorded as skipped in `run.json` instead of silently disappearing.
 
-```json
-{
-  "scenario": "smoke",
-  "kthenaCommit": "abc123",
-  "routerImage": "ghcr.io/volcano-sh/kthena-router:abc123",
-  "startedAt": "2026-05-12T10:30:00Z",
-  "durationSeconds": 300,
-  "client": {
-    "offeredQPS": 50,
-    "completedQPS": 49.7,
-    "errorRate": 0.0,
-    "latencySeconds": {
-      "p50": 0.42,
-      "p90": 0.71,
-      "p95": 0.9,
-      "p99": 1.4,
-      "max": 2.1
-    },
-    "ttftSeconds": {
-      "p50": 0.12,
-      "p90": 0.2,
-      "p95": 0.24,
-      "p99": 0.37
-    },
-    "tpotSeconds": {
-      "p50": 0.018,
-      "p90": 0.025,
-      "p95": 0.03,
-      "p99": 0.048
-    }
-  },
-  "router": {
-    "cpuCoresAvg": 0.8,
-    "cpuCoresMax": 1.6,
-    "memoryMiBAvg": 220,
-    "memoryMiBMax": 310,
-    "schedulerPluginP99Seconds": {
-      "kvcache-aware": 0.008
-    }
-  },
-  "thresholds": {
-    "passed": true,
-    "failures": []
-  }
-}
-```
+The Markdown report should include:
 
-### Report Format
-
-The generated Markdown report will include:
-
-- benchmark purpose and scenario name,
-- Kthena commit, image tags, benchmark tool version, and cluster information,
+- scenario purpose,
+- Kthena commit and image tags,
+- benchmark tool version,
+- cluster and node metadata,
 - workload configuration,
 - backend configuration,
 - throughput and latency tables,
 - TTFT and TPOT tables,
-- CPU, memory, and GPU tables,
+- CPU, memory, and optional GPU tables,
 - router metric summaries,
-- pass/fail threshold results,
-- before/after comparison when a baseline is supplied,
-- flamegraph/profile links when profiling is enabled,
-- analysis notes and identified bottlenecks.
+- threshold results,
+- baseline comparison when provided,
+- links to logs and profiles when available,
+- short analysis of likely bottlenecks and caveats.
 
-The report should be suitable for attaching directly to a PR, issue, or release
-artifact.
+## Reproducibility Controls
 
-### CI Integration
+The benchmark is only useful if maintainers can reproduce or explain its results.
+The implementation must:
 
-CI should use a two-tier benchmark strategy.
+- pin benchmark container dependencies and avoid mutable personal forks as required
+  runtime inputs,
+- record Kthena commit, router image, benchmark image, scenario checksum, and
+  manifest checksums,
+- record Kubernetes version, node count, CPU type, memory, and GPU type when
+  available,
+- record whether token counts came from a real tokenizer or synthetic approximation,
+- separate warmup, measurement, and cooldown windows,
+- detect when the benchmark client is CPU or memory saturated,
+- support repeated runs and report variance for release benchmarks,
+- mark mock-backend results as router-focused, not real inference performance.
 
-#### Tier 1: Smoke Benchmark
+## CI Strategy
 
-Runs on PRs or on a scheduled workflow with mock backends:
+CI should use two tiers.
 
-- Kind cluster or local process mode.
-- Short duration, for example 60 seconds.
+### Tier 1: PR Smoke
+
+Runs on PRs or a lightweight scheduled workflow:
+
+- Kind or local process mode.
+- Mock backend only.
+- Short duration, for example 30 to 60 seconds.
 - Small concurrency, for example 16 to 64.
-- No GPU required.
-- Validates that the benchmark framework, manifests, mock backend, result writer,
-  and basic router path are working.
-- Fails on high error rate, severe latency regression, or missing artifacts.
+- No GPU, model download, or external dataset required.
+- Validates scenario parsing, mock backend, router path, metrics scraping, result
+  writing, and report generation.
+- Fails on benchmark execution errors, missing artifacts, high mock error rate, or
+  severe latency outliers only with intentionally loose thresholds.
 
-#### Tier 2: Nightly or Release Benchmark
+Tier 1 should not be used as a strict performance regression gate until the
+framework has enough historical data to define stable thresholds.
+
+### Tier 2: Nightly or Release
 
 Runs on dedicated infrastructure:
 
 - Longer duration, for example 5 to 30 minutes per scenario.
 - Multiple routing strategies.
-- Real backends when hardware is available.
-- Captures Prometheus metrics and profiles.
-- Uploads artifacts for maintainers.
-- Compares results with the latest accepted baseline.
+- Optional real vLLM/SGLang backends.
+- Prometheus and Kubernetes resource collection.
+- Optional pprof capture.
+- Repeated runs with variance reporting.
+- Artifact upload for maintainers.
+- Comparison against the latest accepted baseline.
 
-Recommended GitHub Actions workflow names:
+Recommended workflow names:
 
 - `router-benchmark-smoke.yaml`
 - `router-benchmark-nightly.yaml`
 
-The benchmark should not make normal PR CI depend on GPU availability.
-
-### Benchmark Scenarios
-
-The initial scenario set should include:
-
-| Scenario | Purpose | Backend | CI Tier |
-| --- | --- | --- | --- |
-| `smoke` | Validate benchmark plumbing and basic router forwarding | mock | Tier 1 |
-| `throughput-sweep` | Find max sustainable QPS under fixed latency thresholds | mock or real | Tier 2 |
-| `latency-sweep` | Measure p50-p99 latency across request rates | mock or real | Tier 2 |
-| `streaming-chat` | Measure TTFT, TPOT, and stream stability | mock or real | Tier 2 |
-| `multi-backend-random` | Measure routing overhead with multiple backends | mock | Tier 1/Tier 2 |
-| `multi-backend-least-request` | Measure scheduling overhead and balance quality | mock | Tier 2 |
-| `kvcache-aware-shared-prefix` | Measure KV-cache-aware plugin overhead and benefit | mock or real | Tier 2 |
-| `prefill-decode-disaggregation` | Measure PD connector and phase-level latency | real or specialized mock | Tier 2 |
-| `rate-limit` | Measure request rejection behavior and overhead | mock | Tier 2 |
-| `backend-failure` | Measure tail latency and error behavior during backend failure | mock | Tier 2 |
-
-### Profiling
-
-The framework will optionally capture profiles during the measurement window:
-
-- CPU profile from the router debug endpoint,
-- heap profile,
-- goroutine profile,
-- mutex/block profiles if enabled,
-- benchmark process CPU and heap profile if useful.
-
-If pprof endpoints are not currently exposed or are not enabled by default, the
-implementation should add a gated configuration option for benchmark and debug
-environments. Profiles must not expose sensitive request payloads.
-
-### Runbook
+## Runbook
 
 The benchmark documentation must include an end-to-end runbook:
 
-1. Install prerequisites: Go, Docker or compatible container tool, `kubectl`, Kind
-   for local clusters, Helm if needed, and Prometheus for metrics collection.
-2. Build Kthena Router image:
-   ```bash
-   make docker-build-router IMG_ROUTER=ghcr.io/volcano-sh/kthena-router:bench
-   ```
-3. Start local cluster:
-   ```bash
-   kind create cluster --name kthena-bench
-   ```
+1. Install prerequisites: Go, Docker or compatible container tool, `kubectl`, Kind,
+   Helm if needed, and access to a Kthena checkout.
+2. Build the router and benchmark images.
+3. Create a Kind cluster or select a benchmark namespace in an existing cluster.
 4. Install Kthena CRDs and router manifests.
-5. Deploy mock backends or real model-serving backends.
-6. Apply the benchmark scenario resources.
-7. Run a smoke scenario:
-   ```bash
-   kthena-router-bench run \
-     --scenario benchmark/kthena-router/scenarios/smoke.yaml \
-     --output benchmark/kthena-router/results/smoke
-   ```
-8. Run a comparison:
-   ```bash
-   kthena-router-bench compare \
-     --baseline benchmark/kthena-router/results/main/run.json \
-     --candidate benchmark/kthena-router/results/pr/run.json
-   ```
-9. Read the report:
-   - Check error rate first.
-   - Check completed QPS against offered QPS.
-   - Check p95/p99 latency and TTFT.
-   - Check TPOT for streaming workloads.
-   - Check router CPU and memory.
-   - Check scheduler plugin p99 when routing strategies are enabled.
-   - Check backend saturation before attributing latency to the router.
-10. Collect artifacts and clean up the namespace or cluster.
+5. Apply benchmark-owned `ModelRoute`, `ModelServer`, router scheduler config, and
+   mock backend manifests.
+6. Run `kthena-router-bench validate`.
+7. Run `kthena-router-bench run`.
+8. Confirm `run.json`, `summary.csv`, `report.md`, `scenario.yaml`, and
+   `environment.json` were produced.
+9. Read the report in this order:
+   - error rate,
+   - completed QPS versus offered QPS,
+   - p95/p99 latency,
+   - TTFT and TPOT for streaming workloads,
+   - router CPU and memory,
+   - scheduler plugin p99,
+   - backend saturation signals.
+10. For comparison, run the same scenario against baseline and candidate images,
+    then run `kthena-router-bench compare`.
+11. Clean up the benchmark namespace or Kind cluster.
 
-### Optimization Workflow
+## Optimization Workflow
 
-When a benchmark surfaces a hotspot, the mentee and maintainers should use the
-following workflow:
+When a benchmark surfaces a hotspot:
 
-1. Confirm the issue is reproducible with the same scenario and environment.
-2. Identify whether the bottleneck is in the client, router, backend, Kubernetes, or
-   cluster infrastructure.
-3. Capture profiles and relevant Prometheus windows.
-4. Open or update a tracking issue with:
-   - scenario name,
-   - baseline run artifact,
-   - observed regression or bottleneck,
-   - profile summary,
-   - suspected code path.
-5. Implement a narrowly scoped optimization PR.
+1. Reproduce the result with the same scenario and environment.
+2. Identify whether the bottleneck is in the client, router, backend, Kubernetes,
+   or cluster infrastructure.
+3. Capture Prometheus windows and optional pprof profiles.
+4. Open or update a tracking issue with the scenario name, run artifacts,
+   observed bottleneck, profile summary, and suspected code path.
+5. Implement a narrow optimization PR.
 6. Attach before/after benchmark results to the PR.
-7. Add a unit, integration, or benchmark test when the optimization fixes a specific
-   code path that can regress independently.
+7. Add a focused unit, integration, or Go benchmark test for the optimized code path
+   when possible.
 
-Likely router hotspots to investigate include:
-
-- request body parsing and reserialization,
-- streaming response proxying,
-- scheduler plugin execution,
-- datastore locking and pod lookup,
-- tokenizer overhead in routing plugins,
-- Redis calls for KV-cache-aware routing,
-- Prometheus label cardinality or hot-path metric updates,
-- active request accounting,
-- rate-limit checks,
-- logging overhead under high QPS.
+Likely router hotspots to investigate include request parsing, response streaming,
+scheduler plugin execution, datastore locking, pod lookup, tokenization, Redis calls
+for KV-cache-aware routing, high-cardinality metrics, active request accounting,
+rate-limit checks, and access logging overhead.
 
 ## Test Plan
-
-The benchmark framework itself requires tests because inaccurate benchmark tools are
-worse than no benchmark.
 
 Unit tests:
 
 - scenario YAML parsing and validation,
 - request payload generation,
 - token distribution generation,
-- latency histogram aggregation,
+- streaming parser,
 - TTFT and TPOT calculation,
+- percentile aggregation,
 - threshold evaluation,
-- baseline comparison logic,
+- baseline comparison,
 - Markdown and JSON report generation.
 
 Integration tests:
@@ -646,32 +753,32 @@ Integration tests:
 - load generator against mock backend,
 - streaming response parser against mock backend,
 - Prometheus scraper against mock metric endpoints,
-- Kubernetes metrics collector with fake or envtest clients,
+- Kubernetes metrics collector with fake clients or envtest,
 - artifact writer and report generation from a complete mock run.
 
 E2E tests:
 
-- Kind-based smoke benchmark with Kthena Router and mock backends,
+- Kind-based smoke benchmark with Kthena Router and mock backend,
 - CI smoke workflow that uploads `run.json` and `report.md`,
 - optional nightly real-backend benchmark on dedicated infrastructure.
 
-Validation criteria:
+Acceptance criteria:
 
-- benchmark run exits non-zero when thresholds fail,
-- result artifacts are complete and schema-valid,
-- repeated mock-backend runs stay within an agreed variance band,
-- compare command correctly flags regressions and improvements,
-- smoke scenario completes within normal PR CI time limits.
+- `validate` rejects malformed scenarios with actionable errors.
+- `run` exits non-zero when required thresholds fail.
+- `run.json` is schema-valid and contains environment metadata.
+- Repeated mock-backend runs stay within an agreed variance band.
+- `compare` correctly flags regressions and improvements.
+- PR smoke completes within normal CI time limits.
 
 ## Milestones
 
-### Milestone 1: Design and Baseline Skeleton
+### Milestone 1: Design and Contracts
 
-- Finalize this proposal with maintainers.
-- Audit existing `benchmark/kthena-router` scaffold.
-- Define result schema and scenario schema.
-- Add smoke scenario and report template.
-- Document local run instructions.
+- Finalize scenario schema and result schema with maintainers.
+- Audit the existing SGLang benchmark scaffold.
+- Add README runbook skeleton and report template.
+- Add `validate` command.
 
 ### Milestone 2: Load Generator and Mock Backend
 
@@ -679,85 +786,81 @@ Validation criteria:
 - Implement deterministic mock backend.
 - Measure latency, TTFT, TPOT, throughput, and errors.
 - Add unit and integration tests.
-- Produce first smoke report.
+- Produce the first local smoke report.
 
-### Milestone 3: Kubernetes Orchestration and Metrics
+### Milestone 3: Kubernetes and Artifacts
 
-- Add Kubernetes Job manifests and RBAC.
-- Add Prometheus and Kubernetes resource metric collection.
-- Add artifact collection and result aggregation.
-- Add Kind-based smoke CI.
+- Add Kubernetes Job, RBAC, and mock backend manifests.
+- Collect router Prometheus metrics and pod CPU/memory.
+- Write `run.json`, `summary.csv`, `report.md`, `scenario.yaml`, and
+  `environment.json`.
+- Add Kind-based smoke runbook.
 
-### Milestone 4: Scenario Suite
+### Milestone 4: MVP CI and Required Scenarios
 
-- Add throughput, latency, multi-backend, routing strategy, rate-limit, shared-prefix,
-  and backend-failure scenarios.
-- Add real backend runbook for vLLM and SGLang.
+- Add `smoke`, `streaming-chat`, and `multi-backend-least-request` scenarios.
+- Add CI smoke workflow.
 - Add baseline comparison command.
+- Document threshold policy and expected variance.
 
-### Milestone 5: Profiling and Optimization
+### Milestone 5: Release Benchmarks and Optimization
 
-- Add optional router profile capture.
-- Run full benchmark suite.
-- Identify clear hotspots.
-- Work with maintainers to land optimization PRs with before/after numbers.
-- Publish final benchmark report.
+- Add throughput and latency sweeps.
+- Add optional profile capture.
+- Add real-backend runbook for vLLM and SGLang.
+- Run the full benchmark suite on a documented cluster profile.
+- Identify clear hotspots and work with maintainers on optimization PRs with
+  before/after numbers.
 
 ## Risks and Mitigations
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
-| Results vary across hardware | Hard to compare absolute numbers | Record environment metadata and compare only within documented profiles |
-| GPU availability blocks CI | PR checks become unreliable | Keep GPU-free smoke tests separate from nightly/release benchmarks |
-| Mock backend hides real inference behavior | Optimizations may not transfer to production | Include real-backend scenarios for release benchmarks |
-| Benchmark client becomes bottleneck | Results understate router capacity | Report client CPU/memory and support distributed load generators later |
-| Prompt generation is not representative | Results miss real-world traffic patterns | Include multiple prompt distributions and dataset-backed scenarios |
-| High-cardinality metrics overload Prometheus | Metrics collection skews benchmark | Keep labels bounded and scrape only required windows |
-| Profiles expose sensitive data | Security concern | Use synthetic prompts by default and avoid profile modes in shared clusters |
-| CI flakiness causes noisy regressions | Maintainers lose trust in benchmarks | Use tolerant thresholds for smoke CI and trend-based nightly comparisons |
+| Scope exceeds mentorship timeline | Framework remains unfinished | Land GPU-free MVP first; keep real backends and optimization PRs as stretch work. |
+| Results vary across hardware | Comparisons become misleading | Record environment metadata and compare only within documented profiles. |
+| GPU availability blocks CI | PR checks become unreliable | Keep PR smoke mock-only and run real benchmarks separately. |
+| Mock backend hides real inference behavior | Results overfit router-only behavior | Label mock results clearly and add real-backend release scenarios. |
+| Benchmark client becomes bottleneck | Router capacity is understated | Record client CPU/memory and detect saturation. |
+| Token counts are inaccurate | TTFT/TPOT analysis becomes misleading | Use real tokenizers when available; mark synthetic counts as approximate. |
+| Metrics collection skews results | Benchmark perturbs the system | Keep scrape windows bounded and labels controlled. |
+| pprof access is unsafe or unavailable | Profiling automation fails | Keep profiling optional and document localhost debug access explicitly. |
+| CI is flaky | Maintainers stop trusting results | Use loose PR thresholds and trend-based nightly comparison. |
 
 ## Open Questions
 
-- Should the first implementation be Go-only, or should it wrap the existing
-  SGLang `bench_serving.py` path while adding Kthena-specific orchestration?
 - Which cluster profile should be the official release benchmark environment?
-- Which scenarios should be required for release qualification versus optional
-  analysis?
-- Should benchmark baselines be committed to the repository, stored as GitHub
-  Actions artifacts, or published externally?
-- Should pprof endpoints be enabled through the existing debug server or a separate
-  benchmark-only flag?
-- What threshold should CI use for severe regression detection in mock-backend runs?
+- Where should accepted baselines live: repository, GitHub Actions artifacts, or an
+  external release bucket?
+- Which real-backend model should be the first release benchmark target?
+- Should profile capture use port-forward, in-pod collection, or a benchmark-only
+  debug sidecar?
 
 ## Alternatives
 
-### Use Only SGLang `bench_serving.py`
+### Continue With Only SGLang `bench_serving.py`
 
-The current benchmark scaffold already packages an SGLang benchmark script. This is
-useful for initial load generation, but it does not provide a complete Kthena Router
-benchmark framework. It lacks Kthena scenario schemas, router-specific metrics,
-Kubernetes resource aggregation, profile capture, standard reports, CI thresholds,
-and baseline comparison. The proposed framework can still reuse it during early
-implementation if doing so accelerates delivery.
+The existing scaffold is useful for load generation experiments, but it does not
+provide Kthena scenario schemas, mock backends, router-specific metric aggregation,
+standard artifacts, CI thresholds, or baseline comparison. It can remain as an
+optional real-backend path but should not be the only benchmark implementation.
 
 ### Use Generic HTTP Tools
 
-Tools such as `wrk`, `hey`, or `vegeta` are excellent for generic HTTP services but
-do not natively model LLM streaming, TTFT, TPOT, output-token timing, shared-prefix
-traffic, or OpenAI-compatible request and response semantics. They can be useful for
-microbenchmarks but are insufficient as the primary benchmark framework.
+Tools such as `wrk`, `hey`, and `vegeta` are strong generic HTTP benchmarks, but
+they do not natively model OpenAI streaming semantics, TTFT, TPOT, output-token
+timing, shared-prefix traffic, or Kthena routing metadata. They are useful for
+microbenchmarks, not as the main framework.
 
-### Use Only Unit Benchmarks
+### Use Only Go Microbenchmarks
 
-Go benchmarks for scheduler plugins, datastore lookups, or tokenization paths are
-valuable and should be added for isolated hotspots. However, they do not measure
-end-to-end router behavior under realistic concurrency, streaming, backend
-saturation, or Kubernetes resource constraints. They should complement, not replace,
-the proposed framework.
+Go benchmarks for scheduler plugins, datastore lookups, tokenization, and
+serialization are valuable, but they do not measure end-to-end router behavior under
+concurrency, streaming, backend saturation, and Kubernetes resource constraints.
+They should complement this framework.
 
 ### Require Real Models for All Runs
 
-Real models provide the most realistic data, but requiring them for every run would
-make the benchmark expensive, slow, and difficult to run in CI. Mock backends provide
-fast and reproducible router-focused coverage, while real-backend scenarios remain
-available for release and optimization validation.
+Real models produce the most realistic numbers, but requiring them for every run
+would make the benchmark expensive, slow, and unsuitable for PR CI. Mock backends
+provide fast router-focused coverage, while real-backend runs remain available for
+release and optimization validation.
